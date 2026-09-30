@@ -56,6 +56,7 @@ def ensure_seed_data(db: Session) -> None:
         dyeType="土靛",
         volumeL=Decimal("800.00"),
         status=Vat.STATUS_REDUCING,
+        cycleSeq=2,  # 已离开闲置一次；当前周期 2 接近 8% 上限（64 m）
     )
     v2 = Vat(
         workshop_id=w1.id,
@@ -63,6 +64,7 @@ def ensure_seed_data(db: Session) -> None:
         dyeType="合成靛",
         volumeL=Decimal("600.00"),
         status=Vat.STATUS_IDLE,
+        cycleSeq=2,  # 上一周期已结束、当前闲置，禁止新浸染
     )
     v3 = Vat(
         workshop_id=w2.id,
@@ -70,6 +72,7 @@ def ensure_seed_data(db: Session) -> None:
         dyeType="土靛",
         volumeL=Decimal("900.00"),
         status=Vat.STATUS_REDUCING,
+        cycleSeq=2,
     )
     v4 = Vat(
         workshop_id=w2.id,
@@ -77,19 +80,21 @@ def ensure_seed_data(db: Session) -> None:
         dyeType="板蓝根靛",
         volumeL=Decimal("750.00"),
         status=Vat.STATUS_READY,
+        cycleSeq=2,
     )
     db.add_all([v1, v2, v3, v4])
     db.flush()
 
     now = datetime.now(timezone.utc)
 
-    def lots(vat_id: int, series):
-        """series: (hours_ago, meters, redox or None)"""
+    def lots(vat_id: int, series, cycle_id: int = 1):
+        """series: (hours_ago, meters, redox or None)；cycle_id 指定所属还原周期。"""
         rows = []
         for hours, meters, redox in series:
             rows.append(
                 DipLot(
                     vat_id=vat_id,
+                    cycleId=cycle_id,
                     dippedAt=now - timedelta(hours=hours),
                     clothMeters=Decimal(meters),
                     redoxMv=Decimal(redox) if redox is not None else None,
@@ -97,47 +102,84 @@ def ensure_seed_data(db: Session) -> None:
             )
         return rows
 
+    # V-01：上周期电位爬坡序列（cycle 1，不计入当前 8% 窗口）
     db.add_all(
         lots(
             v1.id,
             [
-                (36, "18.00", "-410.00"),
-                (28, "22.50", "-455.00"),
-                (20, "30.00", "-490.00"),
-                (12, "40.00", "-510.00"),
-                (8, "45.00", "-520.00"),
+                (60, "18.00", "-410.00"),
+                (52, "22.50", "-455.00"),
+                (44, "30.00", "-490.00"),
             ],
+            cycle_id=1,
         )
     )
+    # V-01 当前周期累计 60.00 m / 上限 64.00 m（800 L × 8%）：
+    # 各交一笔 3 m 时 60+3=63 可入、再 +3=66 超限，恰用于双交至多一成
+    db.add_all(
+        lots(
+            v1.id,
+            [
+                (6, "30.00", "-505.00"),
+                (2, "30.00", "-520.00"),
+            ],
+            cycle_id=2,
+        )
+    )
+    # V-02 闲置：只剩上周期批次，本周期窗口为空且禁止登记
     db.add_all(
         lots(
             v2.id,
             [
-                (6, "8.00", None),
-                (1, "12.00", None),
+                (30, "8.00", None),
+                (25, "12.00", None),
             ],
+            cycle_id=1,
+        )
+    )
+    # V-11：上周期序列（cycle 1），当前周期 42.00 / 72.00 m
+    db.add_all(
+        lots(
+            v3.id,
+            [
+                (72, "25.00", "-390.00"),
+                (62, "35.00", "-430.00"),
+                (54, "48.00", "-460.00"),
+                (46, "60.00", "-480.00"),
+            ],
+            cycle_id=1,
         )
     )
     db.add_all(
         lots(
             v3.id,
             [
-                (40, "25.00", "-390.00"),
-                (30, "35.00", "-430.00"),
-                (22, "48.00", "-460.00"),
-                (14, "60.00", "-480.00"),
+                (8, "22.00", "-495.00"),
+                (3, "20.00", "-515.00"),
             ],
+            cycle_id=2,
+        )
+    )
+    # V-12 可染色：上周期序列（cycle 1），当前周期 38.50 / 60.00 m，
+    # 最新批次电位 -530 mV，满足 ready 校验
+    db.add_all(
+        lots(
+            v4.id,
+            [
+                (72, "20.00", "-420.00"),
+                (56, "28.00", "-470.00"),
+            ],
+            cycle_id=1,
         )
     )
     db.add_all(
         lots(
             v4.id,
             [
-                (48, "20.00", "-420.00"),
-                (32, "28.00", "-470.00"),
-                (20, "33.00", "-505.00"),
-                (10, "38.50", "-530.00"),
+                (9, "20.00", "-505.00"),
+                (2, "18.50", "-530.00"),
             ],
+            cycle_id=2,
         )
     )
     db.commit()

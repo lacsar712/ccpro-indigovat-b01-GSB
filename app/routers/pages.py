@@ -1,10 +1,10 @@
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Optional
 import json
 
 from fastapi import APIRouter, Depends, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from jinja2.utils import markupsafe
 from sqlalchemy.orm import Session, joinedload
@@ -12,7 +12,17 @@ from sqlalchemy.orm import Session, joinedload
 from app.auth import get_current_user
 from app.db import get_db
 from app.models import DipLot, Vat, Workshop
-from app.services.vat_rules import VatRuleError, validate_vat_status_change
+from app.schemas import DipLotIn
+from app.services.vat_rules import (
+    ERR_LOT_TIME,
+    VatNotFoundError,
+    VatRuleError,
+    advance_cycle_on_leave_idle,
+    cloth_cap,
+    lock_vat,
+    save_dip_lot,
+    validate_vat_status_change,
+)
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
@@ -61,6 +71,12 @@ def _vat_payload(vat: Vat) -> dict:
     chronological = lots
     latest = lots[-1] if lots else None
     recent = list(reversed(lots[-8:]))  # 展开区展示近几笔
+    # 本周期累计与服务层同一口径（同缸同 cycleId 求和），保证与列表合计对得上
+    cycle_meters = sum(
+        (Decimal(l.clothMeters) for l in lots if l.cycleId == vat.cycleSeq),
+        Decimal("0"),
+    )
+    cap = cloth_cap(vat.volumeL)
     return {
         "id": vat.id,
         "code": vat.code,
@@ -70,6 +86,10 @@ def _vat_payload(vat: Vat) -> dict:
         "statusLabel": STATUS_LABELS.get(vat.status, vat.status),
         "workshopId": vat.workshop_id,
         "workshopName": vat.workshop.name if vat.workshop else "",
+        "cycleId": vat.cycleSeq,
+        "cycleMeters": float(cycle_meters),
+        "cycleLimit": float(cap),
+        "cycleRatioPct": float(cycle_meters / vat.volumeL * 100) if vat.volumeL else 0.0,
         "lastRedox": float(latest.redoxMv) if latest and latest.redoxMv is not None else None,
         "lastMeters": float(latest.clothMeters) if latest else None,
         "lastDippedAt": latest.dippedAt.strftime("%Y-%m-%d %H:%M") if latest else None,
@@ -77,6 +97,8 @@ def _vat_payload(vat: Vat) -> dict:
         "recentLots": [
             {
                 "id": l.id,
+                "cycleId": l.cycleId,
+                "inCurrentCycle": l.cycleId == vat.cycleSeq,
                 "dippedAt": l.dippedAt.strftime("%Y-%m-%d %H:%M"),
                 "clothMeters": float(l.clothMeters),
                 "redoxMv": float(l.redoxMv) if l.redoxMv is not None else None,
@@ -139,22 +161,25 @@ async def bay_vat_status(
     user = _need_login(request, db)
     if not user:
         return RedirectResponse("/login", status_code=303)
-    item = (
-        db.query(Vat)
-        .options(joinedload(Vat.workshop), joinedload(Vat.lots))
-        .filter(Vat.id == pk)
-        .first()
-    )
     ws = int(workshop) if workshop.strip() else None
-    if not item:
-        return RedirectResponse("/", status_code=303)
     error = None
     try:
-        latest = item.latest_lot()
+        # 与浸染保存同一把缸行锁：状态切换（离开闲置开启新周期）与登记互斥
+        item = lock_vat(db, pk)
+        latest = (
+            db.query(DipLot)
+            .filter(DipLot.vat_id == pk)
+            .order_by(DipLot.dippedAt.desc(), DipLot.id.desc())
+            .first()
+        )
         validate_vat_status_change(item, status, latest)
+        advance_cycle_on_leave_idle(db, item, status)
         item.status = status
         db.commit()
         return RedirectResponse(f"/?vat={pk}" + (f"&workshop={ws}" if ws else ""), status_code=303)
+    except VatNotFoundError:
+        db.rollback()
+        return RedirectResponse("/", status_code=303)
     except VatRuleError as exc:
         error = exc.message
         db.rollback()
@@ -179,29 +204,72 @@ async def bay_log_lot(
     user = _need_login(request, db)
     if not user:
         return RedirectResponse("/login", status_code=303)
-    item = db.get(Vat, pk)
     ws = int(workshop) if workshop.strip() else None
-    if not item:
-        return RedirectResponse("/", status_code=303)
     error = None
     try:
-        lot = DipLot(
-            vat_id=pk,
-            dippedAt=datetime.fromisoformat(dippedAt),
-            clothMeters=Decimal(clothMeters),
-            redoxMv=Decimal(redoxMv) if redoxMv.strip() else None,
+        dipped_at = datetime.fromisoformat(dippedAt)
+    except ValueError:
+        return render(
+            request,
+            "bay.html",
+            _bay_context(request, db, user, ws, pk, ERR_LOT_TIME),
+            status_code=400,
         )
-        db.add(lot)
-        db.commit()
+    try:
+        save_dip_lot(
+            db,
+            vat_id=pk,
+            dipped_at=dipped_at,
+            cloth_meters=clothMeters,
+            redox_mv=redoxMv,
+        )
         return RedirectResponse(f"/?vat={pk}" + (f"&workshop={ws}" if ws else ""), status_code=303)
-    except (ValueError, InvalidOperation) as exc:
-        error = f"浸染记录无效：{exc}"
-        db.rollback()
+    except VatNotFoundError:
+        return RedirectResponse("/", status_code=303)
+    except VatRuleError as exc:
+        error = exc.message
     return render(
         request,
         "bay.html",
         _bay_context(request, db, user, ws, pk, error),
         status_code=400,
+    )
+
+
+@router.post("/api/vats/{pk}/lots")
+async def api_log_lot(
+    pk: int,
+    payload: DipLotIn,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """直打保存接口：与展开区表单共用 save_dip_lot，同规则、同一句中文。"""
+    user = _need_login(request, db)
+    if not user:
+        return JSONResponse({"detail": "请先登录。"}, status_code=401)
+    try:
+        # 以路径 pk 为准，忽略 body 里的 vat_id，避免越缸写入
+        lot = save_dip_lot(
+            db,
+            vat_id=pk,
+            dipped_at=payload.dippedAt,
+            cloth_meters=payload.clothMeters,
+            redox_mv=payload.redoxMv,
+        )
+    except VatNotFoundError:
+        return JSONResponse({"detail": "染缸不存在。"}, status_code=404)
+    except VatRuleError as exc:
+        return JSONResponse({"detail": exc.message}, status_code=400)
+    return JSONResponse(
+        {
+            "id": lot.id,
+            "vatId": lot.vat_id,
+            "cycleId": lot.cycleId,
+            "dippedAt": lot.dippedAt.isoformat(),
+            "clothMeters": float(lot.clothMeters),
+            "redoxMv": float(lot.redoxMv) if lot.redoxMv is not None else None,
+        },
+        status_code=201,
     )
 
 

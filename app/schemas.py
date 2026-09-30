@@ -1,6 +1,6 @@
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -20,10 +20,13 @@ class VatIn(BaseModel):
 
 
 class DipLotIn(BaseModel):
-    vat_id: int
+    # vat_id 仅保留兼容；实际以 URL 路径中的缸号为准，防止越缸写入
+    vat_id: Optional[int] = None
     dippedAt: datetime
-    clothMeters: Decimal
-    redoxMv: Optional[Decimal] = None
+    # 布米合法性（>0、有限数）由服务层 parse_meters 统一裁决，
+    # 直打接口不得在入口以 422 提前打发，保证两条路径同一句中文
+    clothMeters: Any
+    redoxMv: Optional[Any] = None
 
 
 class MessageOut(BaseModel):

@@ -83,12 +83,27 @@
         <div class="panel-grid">
           <div>
             <h3 style="font-size:1rem;margin:0 0 0.65rem;color:#1f4d6b">登记浸染</h3>
-            <form method="post" :action="'/bay/vats/' + selected().id + '/lots'">
+            <p class="hint" style="margin:0 0 0.5rem">
+              单笔布米须大于 0；自上次离开闲置起的本还原周期累计，
+              不得超过缸容的 <strong>8%</strong>：
+              <span x-text="selected().volumeL + ' L × 8% = ' + selected().cycleLimit.toFixed(2) + ' m'"></span>。
+            </p>
+            <p class="hint" style="margin:0 0 0.65rem">
+              本周期已累计
+              <strong
+                :style="selected().cycleMeters >= selected().cycleLimit ? 'color:#b0432a' : ''"
+                x-text="selected().cycleMeters.toFixed(2) + ' / ' + selected().cycleLimit.toFixed(2) + ' m（缸容占比 ' + selected().cycleRatioPct.toFixed(2) + '%）'"
+              ></strong>；
+              <template x-if="selected().status === 'idle'">
+                <span style="color:#b0432a">闲置缸禁止新浸染，须先改状态离开闲置（离开即开启新周期、累计归零）。</span>
+              </template>
+            </p>
+            <form method="post" :action="'/bay/vats/' + selected().id + '/lots">
               <input type="hidden" name="workshop" :value="filterWs || ''">
               <label>浸染时间
                 <input type="datetime-local" name="dippedAt" required :value="nowLocal()">
               </label>
-              <label>布料米数
+              <label>布料米数（大于 0，且不超过剩余额度 <span x-text="(selected().cycleLimit - selected().cycleMeters).toFixed(2)"></span> m）
                 <input type="number" name="clothMeters" step="0.01" min="0.01" required placeholder="例如 24.5">
               </label>
               <label>氧化还原电位 (mV，可空)
@@ -113,8 +128,8 @@
             <h3 style="font-size:0.95rem;margin:1.25rem 0 0.4rem;color:#1f4d6b">近几笔浸染</h3>
             <ul class="lot-list">
               <template x-for="l in selected().recentLots" :key="l.id">
-                <li>
-                  <span x-text="l.dippedAt"></span>
+                <li :style="!l.inCurrentCycle ? 'opacity:0.55' : ''">
+                  <span x-text="l.dippedAt + (l.inCurrentCycle ? '' : '（上周期）')"></span>
                   <span>
                     <span x-text="l.clothMeters + ' m'"></span>
                     ·
@@ -124,6 +139,9 @@
               </template>
               <li x-show="!selected().recentLots.length" style="border:0;color:#6b7c85">尚无记录</li>
             </ul>
+            <p class="hint" style="margin:0.4rem 0 0;font-size:0.78rem">
+              本周期累计 = 上方列出的当前周期批次布米合计（同口径，差为 0）。
+            </p>
           </div>
         </div>
       </div>

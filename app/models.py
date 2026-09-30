@@ -6,6 +6,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
     Numeric,
     String,
     Text,
@@ -52,6 +53,9 @@ class Vat(Base):
     dyeType: Mapped[str] = mapped_column(String(80))
     volumeL: Mapped[Decimal] = mapped_column(Numeric(10, 2))
     status: Mapped[str] = mapped_column(String(20), default=STATUS_IDLE)
+    # 还原周期序号：每次 idle -> 非 idle（离开闲置）+1。
+    # 浸染累计窗口 = 该缸当前周期序号下的全部批次；闲置缸无进行中的周期。
+    cycleSeq: Mapped[int] = mapped_column(default=1, server_default="1")
 
     workshop: Mapped["Workshop"] = relationship(back_populates="vats")
     lots: Mapped[list["DipLot"]] = relationship(back_populates="vat")
@@ -64,9 +68,15 @@ class Vat(Base):
 
 class DipLot(Base):
     __tablename__ = "dip_lots"
+    __table_args__ = (
+        Index("ix_dip_lots_vat_cycle", "vat_id", "cycleId"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     vat_id: Mapped[int] = mapped_column(ForeignKey("vats.id", ondelete="CASCADE"))
+    # 登记时所属还原周期（= Vat.cycleSeq）：累计窗口 = 同缸同周期的全部批次，
+    # 因此「周期累计」与「按缸列出的浸染合计」永远同一口径，差为 0。
+    cycleId: Mapped[int] = mapped_column(default=1, server_default="1")
     dippedAt: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     clothMeters: Mapped[Decimal] = mapped_column(Numeric(10, 2))
     redoxMv: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 2), nullable=True)
