@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
@@ -52,6 +52,10 @@ class Vat(Base):
     dyeType: Mapped[str] = mapped_column(String(80))
     volumeL: Mapped[Decimal] = mapped_column(Numeric(10, 2))
     status: Mapped[str] = mapped_column(String(20), default=STATUS_IDLE)
+    # 本还原周期起点：离开闲置（idle→reducing/ready）的时刻；闲置时为 None
+    cycleStartedAt: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     workshop: Mapped["Workshop"] = relationship(back_populates="vats")
     lots: Mapped[list["DipLot"]] = relationship(back_populates="vat")
@@ -70,5 +74,9 @@ class DipLot(Base):
     dippedAt: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     clothMeters: Mapped[Decimal] = mapped_column(Numeric(10, 2))
     redoxMv: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 2), nullable=True)
+    # 入库时刻（不是浸染发生时刻），周期累计窗口以此为准
+    createdAt: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
 
     vat: Mapped["Vat"] = relationship(back_populates="lots")

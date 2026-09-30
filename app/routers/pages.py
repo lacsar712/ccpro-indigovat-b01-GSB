@@ -4,15 +4,24 @@ from typing import Optional
 import json
 
 from fastapi import APIRouter, Depends, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from jinja2.utils import markupsafe
+from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
 from app.auth import get_current_user
 from app.db import get_db
 from app.models import DipLot, Vat, Workshop
-from app.services.vat_rules import VatRuleError, validate_vat_status_change
+from app.schemas import DipLotIn
+from app.services.vat_rules import (
+    CLOTH_OVER_CAP_MESSAGE,
+    VatRuleError,
+    apply_vat_status_change,
+    cloth_cap_liters,
+    cycle_cloth_total,
+    save_dip_lot,
+)
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
@@ -56,11 +65,19 @@ def _spark_points(lots: list[DipLot], width: int = 72, height: int = 28) -> list
     return pts
 
 
-def _vat_payload(vat: Vat) -> dict:
-    lots = sorted(vat.lots, key=lambda x: (x.dippedAt, x.id))
-    chronological = lots
-    latest = lots[-1] if lots else None
-    recent = list(reversed(lots[-8:]))  # 展开区展示近几笔
+def _vat_payload(db: Session, vat: Vat) -> dict:
+    all_lots = sorted(vat.lots, key=lambda x: (x.dippedAt, x.id))
+    # 列出口径与累计口径完全相同：仅列本还原周期（自上次离开闲置）以来的批次，
+    # 这样「按缸列出的浸染合计」与周期累计天然对平，差为 0
+    if vat.cycleStartedAt is not None:
+        lots = [l for l in all_lots if l.createdAt >= vat.cycleStartedAt]
+    else:
+        lots = []
+    latest = all_lots[-1] if all_lots else None
+    recent = list(reversed(lots[-8:]))  # 展开区展示本周期近几笔
+    cap = cloth_cap_liters(vat.volumeL)
+    # 累计口径直接取服务层函数：与保存校验、按缸合计是同一窗口，差为 0
+    used = cycle_cloth_total(db, vat)
     return {
         "id": vat.id,
         "code": vat.code,
@@ -73,7 +90,11 @@ def _vat_payload(vat: Vat) -> dict:
         "lastRedox": float(latest.redoxMv) if latest and latest.redoxMv is not None else None,
         "lastMeters": float(latest.clothMeters) if latest else None,
         "lastDippedAt": latest.dippedAt.strftime("%Y-%m-%d %H:%M") if latest else None,
-        "spark": _spark_points(chronological),
+        "cycleStartedAt": vat.cycleStartedAt.strftime("%Y-%m-%d %H:%M") if vat.cycleStartedAt else None,
+        "cycleUsedMeters": float(used),
+        "cycleCapMeters": float(cap),
+        "cycleRemainingMeters": float(max(Decimal("0.00"), cap - used)),
+        "spark": _spark_points(all_lots),
         "recentLots": [
             {
                 "id": l.id,
@@ -106,7 +127,7 @@ def _bay_context(
         "request": request,
         "user": user,
         "workshops": [{"id": w.id, "name": w.name, "region": w.region} for w in workshops],
-        "vats": [_vat_payload(v) for v in vats],
+        "vats": [_vat_payload(db, v) for v in vats],
         "filter_workshop": workshop_id,
         "selected_vat": selected_vat,
         "error": error,
@@ -139,20 +160,14 @@ async def bay_vat_status(
     user = _need_login(request, db)
     if not user:
         return RedirectResponse("/login", status_code=303)
-    item = (
-        db.query(Vat)
-        .options(joinedload(Vat.workshop), joinedload(Vat.lots))
-        .filter(Vat.id == pk)
-        .first()
-    )
+    # 锁缸行：与并发浸染提交互斥，避免「离开/回到闲置」与累计窗口交错
+    item = db.scalar(select(Vat).where(Vat.id == pk).with_for_update())
     ws = int(workshop) if workshop.strip() else None
     if not item:
         return RedirectResponse("/", status_code=303)
     error = None
     try:
-        latest = item.latest_lot()
-        validate_vat_status_change(item, status, latest)
-        item.status = status
+        apply_vat_status_change(db, item, status)
         db.commit()
         return RedirectResponse(f"/?vat={pk}" + (f"&workshop={ws}" if ws else ""), status_code=303)
     except VatRuleError as exc:
@@ -179,23 +194,27 @@ async def bay_log_lot(
     user = _need_login(request, db)
     if not user:
         return RedirectResponse("/login", status_code=303)
-    item = db.get(Vat, pk)
     ws = int(workshop) if workshop.strip() else None
-    if not item:
+    if not db.get(Vat, pk):
         return RedirectResponse("/", status_code=303)
     error = None
     try:
-        lot = DipLot(
+        # 唯一保存链：单笔>0、闲置禁染、周期累计缸容8%上限都在此校验，
+        # 与直打接口共用，前端 min/提示不算数
+        save_dip_lot(
+            db,
             vat_id=pk,
-            dippedAt=datetime.fromisoformat(dippedAt),
-            clothMeters=Decimal(clothMeters),
-            redoxMv=Decimal(redoxMv) if redoxMv.strip() else None,
+            dipped_at=datetime.fromisoformat(dippedAt),
+            cloth_meters=Decimal(clothMeters),
+            redox_mv=Decimal(redoxMv) if redoxMv.strip() else None,
         )
-        db.add(lot)
         db.commit()
         return RedirectResponse(f"/?vat={pk}" + (f"&workshop={ws}" if ws else ""), status_code=303)
     except (ValueError, InvalidOperation) as exc:
         error = f"浸染记录无效：{exc}"
+        db.rollback()
+    except VatRuleError as exc:
+        error = exc.message
         db.rollback()
     return render(
         request,
@@ -212,3 +231,48 @@ async def bay_log_lot(
 @router.get("/home")
 async def legacy_redirect():
     return RedirectResponse("/", status_code=303)
+
+
+@router.post("/api/vats/{pk}/lots")
+async def api_log_lot(
+    pk: int,
+    payload: DipLotIn,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """直打保存接口（JSON）。
+
+    与展开区表单是同一个保存入口 save_dip_lot：单笔布米 > 0、闲置缸禁染、
+    周期累计缸容 8% 上限，超限返回的中文文案与展开区完全相同（400 + detail）。
+    """
+    user = _need_login(request, db)
+    if not user:
+        return JSONResponse(status_code=401, content={"detail": "未登录。"})
+    if payload.vat_id != pk:
+        return JSONResponse(status_code=400, content={"detail": "缸号与路径不一致。"})
+    try:
+        lot = save_dip_lot(
+            db,
+            vat_id=pk,
+            dipped_at=payload.dippedAt,
+            cloth_meters=payload.clothMeters,
+            redox_mv=payload.redoxMv,
+        )
+        db.commit()
+    except VatRuleError as exc:
+        db.rollback()
+        return JSONResponse(status_code=400, content={"detail": exc.message})
+    return JSONResponse(
+        status_code=201,
+        content={
+            "detail": "已写入本缸。",
+            "lot": {
+                "id": lot.id,
+                "vat_id": lot.vat_id,
+                "dippedAt": lot.dippedAt.isoformat(),
+                "clothMeters": float(lot.clothMeters),
+                "redoxMv": float(lot.redoxMv) if lot.redoxMv is not None else None,
+                "createdAt": lot.createdAt.isoformat(),
+            },
+        },
+    )

@@ -45,6 +45,8 @@ def ensure_seed_data(db: Session) -> None:
     if db.query(Workshop).first():
         return
 
+    now = datetime.now(timezone.utc)
+
     w1 = Workshop(name="蓝靛湾一号坊", region="黔东南", notes="晨露还原较快")
     w2 = Workshop(name="清水江二号坊", region="黔南", notes="缸体较深，保温好")
     db.add_all([w1, w2])
@@ -56,6 +58,8 @@ def ensure_seed_data(db: Session) -> None:
         dyeType="土靛",
         volumeL=Decimal("800.00"),
         status=Vat.STATUS_REDUCING,
+        # 近上限还原中缸：800 L × 8% = 64.00 m，下列批次合计 58.50 m，余量 5.50 m
+        cycleStartedAt=now - timedelta(hours=48),
     )
     v2 = Vat(
         workshop_id=w1.id,
@@ -63,6 +67,8 @@ def ensure_seed_data(db: Session) -> None:
         dyeType="合成靛",
         volumeL=Decimal("600.00"),
         status=Vat.STATUS_IDLE,
+        # 闲置缸：上一周期已结束，旧批次不计入累计，禁止新浸染
+        cycleStartedAt=None,
     )
     v3 = Vat(
         workshop_id=w2.id,
@@ -70,6 +76,8 @@ def ensure_seed_data(db: Session) -> None:
         dyeType="土靛",
         volumeL=Decimal("900.00"),
         status=Vat.STATUS_REDUCING,
+        # 900 L × 8% = 72.00 m，下列合计 62.00 m
+        cycleStartedAt=now - timedelta(hours=44),
     )
     v4 = Vat(
         workshop_id=w2.id,
@@ -77,11 +85,11 @@ def ensure_seed_data(db: Session) -> None:
         dyeType="板蓝根靛",
         volumeL=Decimal("750.00"),
         status=Vat.STATUS_READY,
+        # 750 L × 8% = 60.00 m，下列合计 49.50 m
+        cycleStartedAt=now - timedelta(hours=52),
     )
     db.add_all([v1, v2, v3, v4])
     db.flush()
-
-    now = datetime.now(timezone.utc)
 
     def lots(vat_id: int, series):
         """series: (hours_ago, meters, redox or None)"""
@@ -101,11 +109,11 @@ def ensure_seed_data(db: Session) -> None:
         lots(
             v1.id,
             [
-                (36, "18.00", "-410.00"),
-                (28, "22.50", "-455.00"),
-                (20, "30.00", "-490.00"),
-                (12, "40.00", "-510.00"),
-                (8, "45.00", "-520.00"),
+                (36, "6.00", "-410.00"),
+                (28, "9.00", "-455.00"),
+                (20, "12.00", "-490.00"),
+                (12, "14.50", "-510.00"),
+                (8, "17.00", "-520.00"),
             ],
         )
     )
@@ -122,10 +130,10 @@ def ensure_seed_data(db: Session) -> None:
         lots(
             v3.id,
             [
-                (40, "25.00", "-390.00"),
-                (30, "35.00", "-430.00"),
-                (22, "48.00", "-460.00"),
-                (14, "60.00", "-480.00"),
+                (40, "10.00", "-390.00"),
+                (30, "14.00", "-430.00"),
+                (22, "18.00", "-460.00"),
+                (14, "20.00", "-480.00"),
             ],
         )
     )
@@ -133,10 +141,10 @@ def ensure_seed_data(db: Session) -> None:
         lots(
             v4.id,
             [
-                (48, "20.00", "-420.00"),
-                (32, "28.00", "-470.00"),
-                (20, "33.00", "-505.00"),
-                (10, "38.50", "-530.00"),
+                (48, "9.00", "-420.00"),
+                (32, "12.00", "-470.00"),
+                (20, "13.50", "-505.00"),
+                (10, "15.00", "-530.00"),
             ],
         )
     )

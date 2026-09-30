@@ -79,12 +79,24 @@
         <p class="hint">当前 <strong x-text="selected().statusLabel"></strong>
           · 最近浸染 <span x-text="selected().lastDippedAt || '—'"></span>
           · 设为可染色须最新批次电位 ≤ -500 mV</p>
+        <p class="hint">
+          布米缸容上限：本缸自上次离开闲置以来的累计布料，不得超过缸容升数的
+          <strong>8%</strong>（换算：<span x-text="selected().volumeL"></span> L × 8% =
+          <span x-text="selected().cycleCapMeters"></span> m）；
+          本周期已累计 <strong x-text="selected().cycleUsedMeters"></strong> m，
+          余量 <span x-text="selected().cycleRemainingMeters"></span> m（自
+          <span x-text="selected().cycleStartedAt || '—'"></span> 起算，回到闲置即清零）。
+          单笔须大于 0；闲置缸禁止新浸染。校验以后端为准。
+        </p>
 
         <div class="panel-grid">
           <div>
             <h3 style="font-size:1rem;margin:0 0 0.65rem;color:#1f4d6b">登记浸染</h3>
             <form method="post" :action="'/bay/vats/' + selected().id + '/lots'">
               <input type="hidden" name="workshop" :value="filterWs || ''">
+              <p class="hint" x-show="selected().status === 'idle'" style="color:#b0413e" x-cloak>
+                该缸闲置中，禁止新浸染；请先在右侧把状态改为还原中。
+              </p>
               <label>浸染时间
                 <input type="datetime-local" name="dippedAt" required :value="nowLocal()">
               </label>

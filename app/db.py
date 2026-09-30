@@ -1,6 +1,6 @@
 import os
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 
@@ -21,6 +21,35 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 class Base(DeclarativeBase):
     pass
+
+
+def ensure_schema() -> None:
+    """create_all 之外的幂等轻量迁移：补还原周期标记列并回填旧库。
+
+    - vats.cycleStartedAt：本还原周期（上次离开闲置）起点，闲置为 NULL；
+    - dip_lots.createdAt：入库时刻。旧行没有该值，用 dippedAt 回填，
+      非闲置缸的周期起点回填为其最早批次时刻，保证累计窗口与既有行对得上。
+    """
+    inspector = inspect(engine)
+    vat_cols = {c["name"] for c in inspector.get_columns("vats")}
+    lot_cols = {c["name"] for c in inspector.get_columns("dip_lots")}
+    with engine.begin() as conn:
+        if "createdAt" not in lot_cols:
+            conn.execute(
+                text('ALTER TABLE dip_lots ADD COLUMN "createdAt" timestamp with time zone')
+            )
+            conn.execute(text('UPDATE dip_lots SET "createdAt" = "dippedAt" WHERE "createdAt" IS NULL'))
+        if "cycleStartedAt" not in vat_cols:
+            conn.execute(
+                text('ALTER TABLE vats ADD COLUMN "cycleStartedAt" timestamp with time zone')
+            )
+            conn.execute(
+                text(
+                    'UPDATE vats SET "cycleStartedAt" = COALESCE(('
+                    'SELECT MIN(l."dippedAt") FROM dip_lots l WHERE l.vat_id = vats.id'
+                    "), now()) WHERE status <> 'idle'"
+                )
+            )
 
 
 def get_db():
